@@ -28,6 +28,8 @@ func HandlerConnection(w http.ResponseWriter, r *http.Request) {
 		room = media.CreateRoom(msg.RoomID, nil)
 		media.Rooms[msg.RoomID] = room
 	}
+	go media.ReadPump(client, room)
+	go media.WritePump(client)
 	go room.Run()
 	media.RoomsMutex.Unlock()
 	handleClientJoin(client, room)

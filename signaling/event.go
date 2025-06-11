@@ -13,19 +13,35 @@ import (
 )
 
 func handleClientJoin(client *media.Client, room *media.Room) {
+	log.Println("Handle join")
 	room.Mu.Lock()
-	defer room.Mu.Unlock()
+	defer func() {
+		room.Mu.Unlock()
+		if r := recover(); r != nil {
+		}
+		log.Println("Unlock")
+	}()
 	if room.Clients[client.UserID] != nil {
-		handleDisconnect(client, room)
+		delete(room.Clients, client.UserID)
 	}
 	room.Clients[client.UserID] = client
-	go media.ReadPump(client, room)
-	go media.WritePump(client)
+	room.MsgChan <- &message.Message{
+		Event:  "user-join",
+		UserID: client.UserID,
+		Payload: map[string]interface{}{
+			"camState": client.IsCamOn,
+			"micState": client.IsMicOn,
+		},
+	}
 	go handleSignaling(client, room)
 }
 
 func handleSignaling(client *media.Client, room *media.Room) {
+	log.Println("Handle signaling")
 	defer func() {
+		if r := recover(); r != nil {
+			log.Println("Recovered from send panic:", r)
+		}
 		room.Mu.Lock()
 		handleDisconnect(client, room)
 		room.Mu.Unlock()
@@ -47,6 +63,14 @@ func handleSignaling(client *media.Client, room *media.Room) {
 					continue
 				}
 			} else {
+				data := msg.Payload
+				if data != nil {
+					streams, ok := data["streams"].([]interface{})
+					if ok {
+						*client.Streams = streams
+					}
+				}
+
 				offer := webrtc.SessionDescription{
 					Type: webrtc.SDPTypeOffer,
 					SDP:  sdpStr,
@@ -122,48 +146,49 @@ func handleSignaling(client *media.Client, room *media.Room) {
 				return
 			}
 
-		case "mic-toggle":
-			isMicOn, ok := msg.Payload["isMicOn"].(bool)
-			if !ok {
-				log.Println("Invalid mic-toggle payload")
-				continue
-			}
-			client.IsMicOn = isMicOn
-
+		case "switch-camera-micro":
+			room.Mu.Lock()
+			client := room.Clients[msg.UserID]
+			room.Mu.Unlock()
+			client.IsCamOn = msg.Payload["camState"].(bool)
+			client.IsMicOn = msg.Payload["micState"].(bool)
 			room.MsgChan <- &message.Message{
-				Event:  "user-mic-toggle",
-				UserID: client.UserID,
+				Event:  "switch-camera-micro",
+				UserID: msg.UserID,
 				Payload: map[string]interface{}{
-					"isMicOn": isMicOn,
+					"camState": msg.Payload["camState"].(bool),
+					"micState": msg.Payload["micState"].(bool),
 				},
 			}
 
-		case "cam-toggle":
-			isCamOn, ok := msg.Payload["isCamOn"].(bool)
-			if !ok {
-				log.Println("Invalid cam-toggle payload")
-				continue
-			}
-			client.IsCamOn = isCamOn
-
-			room.MsgChan <- &message.Message{
-				Event:  "user-cam-toggle",
-				UserID: client.UserID,
-				Payload: map[string]interface{}{
-					"isCamOn": isCamOn,
-				},
-			}
 		case "request-pli":
 			room.Mu.Lock()
 			userSender := room.Clients[msg.UserID]
+			room.Mu.Unlock()
 			// handleReGetClients(client, room)
 			sendPLIWhenReady(userSender.PeerConn)
-			room.Mu.Unlock()
+		case "start-share":
+			room.MsgChan <- &message.Message{
+				Event:   "start-share",
+				UserID:  msg.UserID,
+				Payload: map[string]interface{}{},
+			}
+		case "stop-share":
+			room.MsgChan <- &message.Message{
+				Event:   "stop-share",
+				UserID:  msg.UserID,
+				Payload: map[string]interface{}{},
+			}
 		}
 	}
 }
 
 func handleDisconnect(client *media.Client, room *media.Room) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Println("Recovered from send panic:", r)
+		}
+	}()
 	log.Println("Disconnect")
 	if client.PeerConn != nil {
 		for _, sender := range client.PeerConn.GetSenders() {
@@ -190,7 +215,10 @@ func CreatePeerConnection(client *media.Client, room *media.Room, payload *map[s
 	}
 	offerSDP, _ := offer["sdp"].(string)
 
-	streams, _ := (*payload)["streams"].([]interface{})
+	streams, ok := (*payload)["streams"].([]interface{})
+	if ok {
+		client.Streams = &streams
+	}
 
 	mediaEngine := webrtc.MediaEngine{}
 	mediaEngine.RegisterDefaultCodecs()
@@ -251,7 +279,7 @@ func CreatePeerConnection(client *media.Client, room *media.Room, payload *map[s
 	pc.OnTrack(func(remoteTrack *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		fmt.Printf("SFU: Received %s track from %s\n", remoteTrack.Kind().String(), client.UserID)
 		var typeTrack string
-		for _, stream := range streams {
+		for _, stream := range *client.Streams {
 			streamMap, ok := stream.(map[string]interface{})
 			if !ok {
 				continue
@@ -284,7 +312,7 @@ func CreatePeerConnection(client *media.Client, room *media.Room, payload *map[s
 		}
 		// Đọc RTP từ remoteTrack, gửi đến localTrack (forward )
 		go func() {
-			rtpBuf := make([]byte, 1500)
+			rtpBuf := make([]byte, 4096)
 			for {
 				n, _, readErr := remoteTrack.Read(rtpBuf)
 				if readErr != nil {
@@ -304,34 +332,35 @@ func CreatePeerConnection(client *media.Client, room *media.Room, payload *map[s
 		}()
 
 		// **FIX: Broadcast track to all existing clients and trigger renegotiation**
-		room.Mu.Lock()
 		var clientsToRenegotiate []*media.Client
-
-		for _, other := range room.Clients {
-			if other.UserID == client.UserID || other.PeerConn == nil {
-				continue
-			}
-
-			var addedTrack *webrtc.TrackLocalStaticRTP
-			if typeTrack == "audio" {
-				addedTrack = client.AudioTrack
-			} else if typeTrack == "video" {
-				addedTrack = client.VideoTrack
-			} else if typeTrack == "screen" {
-				addedTrack = client.ScreenTrack
-			}
-
-			if addedTrack != nil {
-				_, err := other.PeerConn.AddTrack(addedTrack)
-				if err != nil {
-					log.Printf("SFU: failed to add %s track to %s: %v\n", remoteTrack.Kind().String(), other.UserID, err)
+		func() {
+			room.Mu.Lock()
+			defer room.Mu.Unlock()
+			for _, other := range room.Clients {
+				if other.UserID == client.UserID || other.PeerConn == nil {
 					continue
 				}
-				// Collect clients that need renegotiation
-				clientsToRenegotiate = append(clientsToRenegotiate, other)
+
+				var addedTrack *webrtc.TrackLocalStaticRTP
+				if typeTrack == "audio" {
+					addedTrack = client.AudioTrack
+				} else if typeTrack == "video" {
+					addedTrack = client.VideoTrack
+				} else if typeTrack == "screen" {
+					addedTrack = client.ScreenTrack
+				}
+
+				if addedTrack != nil {
+					_, err := other.PeerConn.AddTrack(addedTrack)
+					if err != nil {
+						log.Printf("SFU: failed to add %s track to %s: %v\n", remoteTrack.Kind().String(), other.UserID, err)
+						continue
+					}
+					// Collect clients that need renegotiation
+					clientsToRenegotiate = append(clientsToRenegotiate, other)
+				}
 			}
-		}
-		room.Mu.Unlock()
+		}()
 
 		// **FIX: Renegotiate with all existing clients to make them see the new track**
 		for _, otherClient := range clientsToRenegotiate {
@@ -348,6 +377,15 @@ func CreatePeerConnection(client *media.Client, room *media.Room, payload *map[s
 				"streamId": localTrack.StreamID(),
 			},
 		}
+		room.MsgChan <- &message.Message{
+			Event:  "switch-camera-micro",
+			UserID: client.UserID,
+			RoomID: room.ID,
+			Payload: map[string]interface{}{
+				"camState": client.IsCamOn,
+				"micState": client.IsMicOn,
+			},
+		}
 
 		// **FIX: Send PLI only when connection is ready**
 		// go func() {
@@ -360,17 +398,37 @@ func CreatePeerConnection(client *media.Client, room *media.Room, payload *map[s
 		if state == webrtc.PeerConnectionStateConnected {
 			log.Printf("Client %s peer connection connected", client.UserID)
 			handleGetTrackFromClients(client, room)
+			var userStates []map[string]interface{}
 
+			for _, other := range room.Clients {
+				if client.UserID != other.UserID {
+					userStates = append(userStates, map[string]interface{}{
+						"userId":   other.UserID,
+						"camState": other.IsCamOn,
+						"micState": other.IsMicOn,
+					})
+				}
+			}
+			if len(userStates) > 0 {
+				client.Send <- message.Message{
+					Event: "get-all-user-states",
+					Payload: map[string]interface{}{
+						"users": userStates,
+					},
+				}
+			}
 			// **FIX: Send PLI after a small delay to ensure everything is ready**
 			go func() {
 				time.Sleep(1 * time.Second)
-				room.Mu.Lock()
-				for _, other := range room.Clients {
-					if other.PeerConn != nil {
-						sendPLIWhenReady(other.PeerConn)
+				func() {
+					room.Mu.Lock()
+					defer room.Mu.Unlock()
+					for _, other := range room.Clients {
+						if other.PeerConn != nil {
+							sendPLIWhenReady(other.PeerConn)
+						}
 					}
-				}
-				room.Mu.Unlock()
+				}()
 			}()
 		}
 	})
@@ -383,12 +441,12 @@ func CreatePeerConnection(client *media.Client, room *media.Room, payload *map[s
 			go func() {
 				time.Sleep(1 * time.Second)
 				room.Mu.Lock()
+				defer room.Mu.Unlock()
 				for _, other := range room.Clients {
 					if other.PeerConn != nil {
 						sendPLIWhenReady(other.PeerConn)
 					}
 				}
-				room.Mu.Unlock()
 			}()
 		}
 	})
@@ -399,17 +457,19 @@ func CreatePeerConnection(client *media.Client, room *media.Room, payload *map[s
 		defer ticker.Stop()
 
 		for range ticker.C {
-			room.Mu.Lock()
-			if client.PeerConn != nil && client.PeerConn.ConnectionState() == webrtc.PeerConnectionStateConnected {
-				sendPLIWhenReady(client.PeerConn)
-			}
-
-			for _, other := range room.Clients {
-				if other.PeerConn != nil && other.PeerConn.ConnectionState() == webrtc.PeerConnectionStateConnected {
-					sendPLIWhenReady(other.PeerConn)
+			func() {
+				room.Mu.Lock()
+				defer room.Mu.Unlock()
+				if client.PeerConn != nil && client.PeerConn.ConnectionState() == webrtc.PeerConnectionStateConnected {
+					sendPLIWhenReady(client.PeerConn)
 				}
-			}
-			room.Mu.Unlock()
+
+				for _, other := range room.Clients {
+					if other.PeerConn != nil && other.PeerConn.ConnectionState() == webrtc.PeerConnectionStateConnected {
+						sendPLIWhenReady(other.PeerConn)
+					}
+				}
+			}()
 		}
 	}()
 
@@ -489,13 +549,15 @@ func handleGetTrackFromClients(client *media.Client, room *media.Room) {
 	// **FIX: Send PLI after everything is set up**
 	go func() {
 		time.Sleep(1 * time.Second)
-		room.Mu.Lock()
-		for _, other := range room.Clients {
-			if other.PeerConn != nil {
-				sendPLIWhenReady(other.PeerConn)
+		func() {
+			room.Mu.Lock()
+			defer room.Mu.Unlock()
+			for _, other := range room.Clients {
+				if other.PeerConn != nil {
+					sendPLIWhenReady(other.PeerConn)
+				}
 			}
-		}
-		room.Mu.Unlock()
+		}()
 	}()
 }
 

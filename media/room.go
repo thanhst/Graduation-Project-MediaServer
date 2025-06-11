@@ -1,6 +1,7 @@
 package media
 
 import (
+	"log"
 	"mediaserver/media/message"
 	"sync"
 
@@ -43,11 +44,23 @@ func (r *Room) Run() {
 }
 func (r *Room) broadcast(msg *message.Message) {
 	r.Mu.RLock()
-	defer r.Mu.RUnlock()
+	defer func() {
+		if recover := recover(); recover != nil {
+
+		}
+		r.Mu.RUnlock()
+	}()
 	for _, c := range r.Clients {
 		if c.UserID == msg.UserID {
 			continue
 		}
-		c.Send <- *msg
+		func(c *Client) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic when sending to %s: %v", c.UserID, r)
+				}
+			}()
+			c.Send <- *msg
+		}(c)
 	}
 }

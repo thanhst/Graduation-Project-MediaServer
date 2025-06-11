@@ -23,6 +23,7 @@ type Client struct {
 	Send        chan message.Message
 	Read        chan message.Message
 	Done        chan struct{}
+	Streams     *[]interface{}
 	CloseOnce   sync.Once
 }
 
@@ -43,11 +44,14 @@ func CreateClientConnection(userId string, roomId string, role string, isCamOn b
 
 func ReadPump(user *Client, room *Room) {
 	defer func() {
+		if r := recover(); r != nil {
+		}
 		delete(room.Clients, user.UserID)
+		log.Println("Delete user")
 		user.CloseOnce.Do(func() {
 			close(user.Done)
 			close(user.Read)
-			// close(user.Send)
+			close(user.Send)
 			user.Conn.Close()
 		})
 	}()
@@ -75,7 +79,7 @@ func WritePump(user *Client) {
 			user.CloseOnce.Do(func() {
 				close(user.Done)
 				close(user.Read)
-				// close(user.Send)
+				close(user.Send)
 				user.Conn.Close()
 			})
 			break
@@ -83,6 +87,11 @@ func WritePump(user *Client) {
 	}
 }
 func (c *Client) SafeSend(msg message.Message) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Println("Recovered from send panic:", r)
+		}
+	}()
 	select {
 	case <-c.Done:
 		return
